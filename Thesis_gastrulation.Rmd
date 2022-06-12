@@ -1,0 +1,287 @@
+---
+title: "Thesis Titel"
+output: html_notebook
+---
+
+```{r load modules}
+library(tidyverse)
+library(MOFA)
+library(destiny)
+library(pheatmap)
+```
+
+-- Read in the MOFA factors from the MOFA model and the corresponding meta data --
+```{r read in MOFA data}
+# MOFA model
+MOFA_model <- MOFA::loadModel(file = "/mnt/raid/anders/scnmt_gastrulation/scnmt_gastrulation-tar-file/metaccrna/mofa/all_stages/hdf5/model_1.hdf5")
+
+# Meta data to MOFA model
+meta_data <- read_table("/mnt/raid/leoni/scnmt_gastrulation/sample_metadata.txt") %>%
+  rename("cell_name" = "sample") 
+```
+
+-- Compute a UMAP out of four MOFA factors --
+```{r UMAP}
+# Get factors from the MOFA model
+MOFA_factors <- getFactors(MOFA_model)
+
+# UMAP with factor 1,2,4 and 9
+set.seed( 12345 )
+uwot::umap( MOFA_factors[, c(1,2,4,9)], n_neighbors=25, min_dist=0.55 ) -> ump
+
+
+# Set column and row names for UMAP 
+colnames(ump) <- c("U1", "U2")
+rownames(ump) <- rownames(MOFA_factors)
+```
+
+-- UMAP Plot colored in different interesting aspects like stage and lineage of the cells --
+```{r Visualization of UMAP}
+# Join UMAp with meta data to obtain cell information
+ump_with_metadata <- ump %>% 
+  as_tibble( rownames= "cell_name" ) %>%
+  left_join(meta_data, by = "cell_name") 
+
+# Plot colored after stage
+ggplot(ump_with_metadata, aes(x = U1, y = U2, col = stage)) +
+  geom_point(size = 0.5) +
+  coord_fixed() +
+  labs(title = "UMAP of MOFA factors colored by stage")
+
+# Plot colored after lineage
+ggplot(ump_with_metadata, aes(x = U1, y = U2, col = lineage10x)) +
+  geom_point(size = 1) +
+  coord_fixed()+
+  labs(title = "UMAP of MOFA factors colored by lineage",
+       x = "UMAP1",
+       y = "UMAP2",
+       color = "Lineage", 
+       tag = "a") +
+  theme_classic()
+
+```
+
+-- Create a pseudotime by a diffusion map, which should represent the development course of mesoderm cells --
+```{r Pseudotime}
+# Diffusion Map of all cells
+dm <- DiffusionMap( MOFA_factors[, c(1,2,4,9)], verbose=TRUE ) 
+
+# Diffusion pseudotime
+dpt <- DPT( dm ) 
+
+# Take two arbitrary cells in E4.5
+two_cells_4.5 <- sample( which( ump_with_metadata$stage=="E4.5" & ump_with_metadata$lineage10x_2=="Epiblast" ), 2 ) 
+
+# Compare pseudotime of all cells to these two
+{plot( dpt[two_cells_4.5[1],], dpt[two_cells_4.5[2],], 
+      col=1+ (ump_with_metadata$stage=="E7.5" & ump_with_metadata$lineage10x_2=="Mesoderm"),
+      main = "Pseudotime of all cells compared to two arbitrary cells in E4.5",
+      ylab = "Distance to second arbitrary cell", 
+      xlab = "Distance to first arbitrary cell")
+legend("topleft", "Mesoderm", fill = "#F8766D")}
+# Mesoderm cells are all more or less equally far
+
+# Take the farthest cell
+meso_tip <- set_names( dpt[two_cells_4.5[1], ], ump_with_metadata$cell_name )[ ump_with_metadata$stage=="E7.5" & ump_with_metadata$lineage10x_2=="Mesoderm" ] %>%
+  which.max() %>% names() 
+end_cell <- which( ump_with_metadata$cell_name == meso_tip ) 
+
+# Find the root cell
+end_cell_pt <- set_names( dpt[end_cell, ], ump_with_metadata$cell_name )[ ump_with_metadata$stage=="E4.5" & ump_with_metadata$lineage10x_2=="Epiblast" ] 
+root_cell_name <- names(which( end_cell_pt ==  median(end_cell_pt[-3])))
+root_cell <- which( ump_with_metadata$cell_name == root_cell_name )
+
+#Compare distances to either end
+plot( dpt[end_cell,], dpt[root_cell,],
+      main = "Distances of cells to the root and end cell",
+      ylab = "Root cell", 
+      xlab = "End cell" )
+
+# Plot sum of distances to both ends vs distances to root
+# Endoderm: intercept=18.5,slope=.4
+# Ectoderm: (intercept=6,slope=1.2 )/  8 ; .4
+tibble( dist_to_root = dpt[root_cell,], dists_sum = dpt[end_cell,]+dpt[root_cell,] ) %>%
+  bind_cols( ump_with_metadata ) %>%
+  ggplot +
+  geom_point( aes( x=dist_to_root, y=dists_sum, col=stage)) +
+  geom_abline(intercept=11,slope=.7) +
+  labs(title = "Cutoff for cells that do not play a role development course of mesoderm cells",
+       x = "Distance to root cell",
+       y = "Distance to end cell")
+
+# Put the pseudotime in a table
+pseudotime <- tibble( cell_name = ump_with_metadata$cell_name, dist_to_root = dpt[root_cell,], dists_sum = dpt[end_cell,]+dpt[root_cell,] ) %>%
+  mutate( in_lineage = dists_sum < 11 + .7 *dist_to_root ) %>%
+  mutate( pseudotime = ifelse( in_lineage, dist_to_root, NA ) ) %>%
+  select( cell_name, pseudotime )
+
+# Visualization 
+ggplot(ump_with_metadata, aes(x = U1, y = U2, col = pseudotime$pseudotime)) +
+  geom_point()+
+  coord_fixed() +
+  labs(title = "Pseudotime for cells part of mesoderm development",
+       x = "UMAP1",
+       y = "UMAP2",
+       col = "Pseudotime",
+       tag = "b")
+```
+
+-- Read in Methylation data --
+```{r read in methylation data}
+# Methylation Matrix with methylated sites pro total, joined with the pseudotime
+met_prom_pt <- read_tsv("/mnt/raid/anders/scnmt_gastrulation/scnmt_gastrulation-tar-file/met/feature_level/prom_2000_2000.tsv.gz", 
+                     col_names = c("cell_name", "gene_id", "type", "methylated_sites", "total_sites", "percentage")) %>%
+  left_join( pseudotime ) %>%
+  filter(!is.na(pseudotime))
+```
+
+-- Calculate the average methylation of a gene before and after a point in pseudotime and the difference between those to find out at which point in pseudotime the gene goes from mostly (un)methylated to the opposite --
+```{r Average methylation difference}
+
+# Find transcript name of gene
+met_prom_pt %>% group_by(gene_id) %>% summarise() %>% left_join(gene_names) %>% rename(gene_name = "Gene name") %>% filter(gene_name == "Crisp4")
+
+# Take out one gene of interest            
+met_prom_pt %>% filter( gene_id == "ENSMUSG00000030001" ) -> met_prom_pt_one_gene  
+
+met_prom_pt_one_gene %>%
+ arrange( pseudotime ) %>%
+ mutate( 
+   avg_meth_before = cumsum(methylated_sites) / cumsum(total_sites) ,
+   avg_meth_after = (sum(methylated_sites)-cumsum(methylated_sites)) / (sum(total_sites)-cumsum(total_sites)))%>%
+  mutate( avg_meth_diff = ifelse( 
+    cumsum(methylated_sites) > 40 & sum(methylated_sites) - cumsum(methylated_sites)>40,
+    abs(avg_meth_after - avg_meth_before), NA ) ) %>%
+ggplot() + 
+  geom_jitter( aes( x=pseudotime, y=(methylated_sites/total_sites)*100 ), width=0, height=.03 ) + 
+  geom_line(aes(x=pseudotime, y=avg_meth_before*100, col="Average methylation before"), size=1 ) +
+  geom_line(aes(x=pseudotime, y=avg_meth_after*100, col="Average methylation after"), size=1 ) +
+  geom_line(aes(x=pseudotime, y=avg_meth_diff*100, col = "Difference"), size=1 ) +
+  labs(y = "Methylated sites [%]",
+       x = "Pseudotime" ,
+       color = "",
+       tag = "a") +
+  theme_classic()
+```
+
+-- Find the Inflection points, where a gene goes from mostly (un)methylated to the opposite, for all genes --
+```{r Inflection points}
+# Function to find the Inflection point
+find_infl <- function( a, id ) {
+  a %>%
+    arrange( pseudotime ) %>%
+    mutate( 
+      avg_meth_before = cumsum(methylated_sites) / cumsum(total_sites),
+      avg_meth_after = (sum(methylated_sites)-cumsum(methylated_sites)) / (sum(total_sites)-cumsum(total_sites))
+  ) %>%
+  mutate( avg_meth_diff = ifelse( 
+    cumsum(methylated_sites) > 40 & sum(methylated_sites) - cumsum(methylated_sites)>40,
+    avg_meth_after - avg_meth_before, 0 ) ) %>%
+  summarise(
+    gene_id = id,
+    infl_cell = which.max( abs( avg_meth_diff ) ),
+    infl_point = pseudotime[ infl_cell ],
+    meth_diff = avg_meth_diff[ infl_cell ],
+    total_sites = sum(total_sites)
+  )
+}    
+
+
+#  find the Inflection point for all
+met_prom_pt %>% 
+  group_by( gene_id ) %>%
+  group_map( find_infl )  %>%
+  bind_rows() -> infl_point_all_gene
+
+# Visualization
+infl_point_all_gene %>%
+  filter(meth_diff != 0) %>%
+ggplot( aes(x = infl_point, y = meth_diff*100)) + 
+  geom_jitter(size = .5)+
+  #geom_vline(aes( xintercept = 2.5))+
+  labs(y = "Methylation difference [%]",
+       x = "Pseudotime",
+       tag = "c") +
+  theme_classic()
+```
+
+-- Define cubic kernel that is used for smoothing the methylation data --
+```{r Kernel}
+kernel <- function(x) ifelse( abs(x)<1, (1-(abs(x))^3)^3, 0 )
+```
+
+-- --
+```{r Smoothing}
+met_prom_pt %>%
+  select(- cell_name, -type, -percentage) %>% 
+  group_by( gene_id ) -> met_prom_pt_grouped
+
+met_prom_pt_grouped %>% summarise() -> all_genes
+
+met_prom_pt_grouped %>%
+  group_split()-> met_prom_pt_split
+
+pt_grid <- seq( min(met_prom_pt$pseudotime, na.rm = TRUE), max(met_prom_pt$pseudotime, na.rm = TRUE), length.out = 100)
+
+smooth_met <- function( gene ){
+  
+  
+  met_prom_pt_split[[which(group_keys(met_prom_pt_grouped) == gene)]] -> a
+  
+  tib <- tibble(met_sites = a$methylated_sites,
+                total_sites = a$total_sites,
+                pseudotime = a$pseudotime)
+  
+  
+  
+  smooth_value <- sapply(pt_grid, function(pt) {
+    weight <- kernel(( pt - tib$pseudotime ) / 1)
+    sum(tib$met_sites*weight) / sum(tib$total_sites*weight)
+  })
+  
+  names(smooth_value) <- round( pt_grid, 2 )
+  smooth_value
+}
+
+sapply(all_genes$gene_id, smooth_met) %>%
+  t() -> smoothed_met
+```
+
+-- Look at the smoothed methylation from one chosen gene --
+```{r Plot smoothed methylation one gene}
+met_prom_pt %>% group_by(gene_id) %>% summarise() %>% left_join(gene_names) %>% rename(gene_name = "Gene name") %>% filter(gene_name == "Lefty2") 
+
+smooth_met_example <- smooth_met( "ENSMUSG00000030001" ) %>% 
+  enframe(name = "pt", value = "smoothed_value") %>%
+  mutate(pt = as.numeric(pt))
+
+met_prom_pt %>%
+  filter(gene_id == "ENSMUSG00000030001") %>%
+ggplot()+
+  geom_point(aes(x = pseudotime, y = percentage)) +
+  geom_line(data = smooth_met_example, aes(x = pt, y = smoothed_value*100, group = 1, col = "red")) +
+  labs(y = "Methylation [%]",
+       x = "Pseudotime",
+       tag = "d") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+
+-- -- 
+```{r Heatmap}
+
+set.seed(12345)
+t(smoothed_met[sample.int( nrow(smoothed_met), 3000 ), ]*100) -> matplot_3000
+t(matplot_3000) -> heatmap_3000
+
+
+matplot( x=pt_grid,y=matplot_3000, type = "l", col= alpha("black", 0.1), lty = "solid", xlab = "Pseudotime", ylab = "Methylation [%]")
+mtext("c", at=-1.5, line=2)
+
+
+fields::image.plot( x=as.numeric(colnames(heatmap_3000)), z=( t(heatmap_3000[order(heatmap_3000[,26] ),]) ), ylim=c(-.1,1), col = viridisLite::cividis(100), zlim=c(0,100), xlab="Pseudotime", ylab="Genes" , yaxt="n")
+segments( unique(met_prom_pt$pseudotime), -.8, unique(met_prom_pt$pseudotime), -.03, col=alpha("black",.3) )
+mtext("e", at=-.8, line=2)
+```
+
